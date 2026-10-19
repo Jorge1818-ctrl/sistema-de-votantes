@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+usuarios.json
+usuarios.json.tmp
+votantes.csv
