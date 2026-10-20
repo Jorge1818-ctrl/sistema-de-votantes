@@ -691,27 +691,26 @@ elif opcion == "Administrar perfiles" and admin:
 
                 st.rerun()
 
-            except Exception as e:
-                # Evita dejar una cuenta huérfana si Auth la creó,
-                # pero falló la creación de su perfil.
-                if usuario_nuevo:
-                    try:
-                        cliente_privado.auth.admin.delete_user(
-                            str(usuario_nuevo.id)
-                        )
-                    except Exception:
-                        st.warning(
-                            "No se pudo revertir automáticamente la cuenta. "
-                            "Revisa Authentication → Users y public.perfiles "
-                            "antes de volver a intentar."
-                        )
+ 
+except Exception as e:
+    # Evita dejar una cuenta huérfana si Auth la creó,
+    # pero falló la creación de su perfil.
+    if usuario_nuevo:
+        try:
+            cliente_privado.auth.admin.delete_user(
+                str(usuario_nuevo.id)
+            )
+        except Exception:
+            st.warning(
+                "No se pudo revertir automáticamente la cuenta. "
+                "Revisa Authentication → Users y public.perfiles "
+                "antes de volver a intentar."
+            )
 
-                error_seguro(
-                    "No se pudo completar la creación de la cuenta. "
-                    "Comprueba la clave de administración, el correo y "
-                    "las tablas de Supabase.",
-                    e,
-                )
+    st.error("No se pudo completar la creación de la cuenta.")
+    st.write("Detalle técnico del error:")
+    st.code(str(e))
+
 
     st.divider()
     st.subheader("Usuarios registrados")
