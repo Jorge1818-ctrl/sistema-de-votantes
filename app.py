@@ -376,23 +376,37 @@ elif opcion == "Consultar registros":
 
 elif opcion == "Gráfica de registros":
     st.subheader("Cantidad de registros por partido asociado")
+
     if datos.empty:
         st.info("Registra personas para generar la gráfica.")
     else:
         conteo = (
             datos["afiliacion_partido"]
             .fillna("Sin especificar")
+            .replace("", "Sin especificar")
             .value_counts()
+            .rename_axis("Partido")
+            .reset_index(name="Cantidad")
         )
-        st.bar_chart(conteo)
+
+        st.bar_chart(
+            conteo,
+            x="Partido",
+            y="Cantidad",
+            x_label="Partido asociado",
+            y_label="Cantidad de registros",
+        )
+
+        st.subheader("Detalle de registros por partido")
         st.dataframe(
-            conteo.rename("Cantidad").reset_index(),
+            conteo,
             use_container_width=True,
             hide_index=True,
         )
+
         st.caption(
-            "La gráfica muestra registros administrativos, no votos emitidos "
-            "ni resultados oficiales."
+            "La gráfica muestra registros administrativos, "
+            "no votos emitidos ni resultados oficiales."
         )
 
 
