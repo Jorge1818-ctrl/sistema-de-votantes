@@ -1230,7 +1230,7 @@ elif opcion == "Historial de accesos" and admin:
         respuesta = (
             sb.table("registro_accesos")
             .select("*")
-            .order("fecha", desc=True)
+            .order("creado_en", desc=True)
             .execute()
         )
 
