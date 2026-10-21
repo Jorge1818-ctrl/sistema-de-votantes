@@ -1,9 +1,13 @@
-
 import streamlit as st
 import pandas as pd
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from supabase import create_client
+
+
+# =========================================================
+# CONFIGURACIÓN GENERAL
+# =========================================================
 
 st.set_page_config(
     page_title="Sistema de Registro de Votantes",
@@ -12,270 +16,272 @@ st.set_page_config(
 )
 
 TZ = ZoneInfo("America/Mexico_City")
-PARTIDOS = ["Partido A", "Partido B", "Partido C", "Partido D", "Otro"]
+
+PARTIDOS = [
+    "Partido A",
+    "Partido B",
+    "Partido C",
+    "Partido D",
+    "Otro",
+    "Sin especificar",
+]
 
 
-def ahora():
-    return datetime.now(TZ).isoformat()
+# =========================================================
+# CONEXIÓN CON SUPABASE
+# =========================================================
+
+def obtener_secreto(*nombres):
+    """Busca el primer secreto configurado."""
+    for nombre in nombres:
+        valor = st.secrets.get(nombre)
+        if valor:
+            return str(valor).strip()
+    return ""
 
 
-def config():
-    """Lee las credenciales públicas de Supabase."""
-    try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_ANON_KEY"]
+SUPABASE_URL = obtener_secreto("SUPABASE_URL")
 
-        if not url or not key:
-            raise ValueError("Faltan las credenciales públicas de Supabase.")
+# Acepta el nombre antiguo ANON_KEY o el nuevo PUBLISHABLE_KEY.
+SUPABASE_PUBLIC_KEY = obtener_secreto(
+    "SUPABASE_ANON_KEY",
+    "SUPABASE_PUBLISHABLE_KEY",
+)
 
-        return url, key
-
-    except Exception as e:
-        st.error(
-            "Falta la configuración de Supabase. En Streamlit abre "
-            "Settings → Secrets y revisa SUPABASE_URL y SUPABASE_ANON_KEY."
-        )
-        with st.expander("Detalles técnicos"):
-            st.code(str(e)[:1200])
-        st.stop()
-
-
-def cliente_administrador():
-    """Cliente privado para operaciones administrativas de Supabase."""
-    url, _ = config()
-    clave_privada = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
-
-    if not clave_privada:
-        raise ValueError(
-            "No se encontró SUPABASE_SERVICE_ROLE_KEY en Streamlit Secrets."
-        )
-
-    return create_client(url, clave_privada)
+# Esta clave es exclusivamente para operaciones administrativas.
+SUPABASE_ADMIN_KEY = obtener_secreto(
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "SUPABASE_SECRET_KEY",
+)
 
 
 def nuevo_cliente():
-    """Crea el cliente de la sesión del usuario autenticado."""
-    url, key = config()
-    sb = create_client(url, key)
+    """Crea un cliente normal de Supabase."""
+    if not SUPABASE_URL or not SUPABASE_PUBLIC_KEY:
+        raise RuntimeError(
+            "Falta SUPABASE_URL o SUPABASE_ANON_KEY/"
+            "SUPABASE_PUBLISHABLE_KEY en los Secrets."
+        )
 
-    access = st.session_state.get("access_token")
-    refresh = st.session_state.get("refresh_token")
-
-    if access and refresh:
-        try:
-            sb.auth.set_session(access, refresh)
-            ses = sb.auth.get_session()
-
-            if ses:
-                st.session_state["access_token"] = ses.access_token
-                st.session_state["refresh_token"] = ses.refresh_token
-
-        except Exception as e:
-            raise RuntimeError(
-                "No se pudo restaurar la sesión de Supabase. "
-                f"Detalle: {str(e)[:800]}"
-            ) from e
-
-    return sb
+    return create_client(
+        SUPABASE_URL,
+        SUPABASE_PUBLIC_KEY,
+    )
 
 
-def registrar_evento(sb, uid, evento, exitoso=True):
+def cliente_administrador():
+    """Crea el cliente privado para administrar usuarios."""
+    if not SUPABASE_URL:
+        raise RuntimeError("Falta SUPABASE_URL en los Secrets.")
+
+    if not SUPABASE_ADMIN_KEY:
+        raise RuntimeError(
+            "Falta SUPABASE_SERVICE_ROLE_KEY o "
+            "SUPABASE_SECRET_KEY en los Secrets. "
+            "La clave Publishable no sirve para crear usuarios."
+        )
+
+    return create_client(
+        SUPABASE_URL,
+        SUPABASE_ADMIN_KEY,
+    )
+
+
+# =========================================================
+# FUNCIONES AUXILIARES
+# =========================================================
+
+def hora_actual():
+    return datetime.now(TZ).isoformat()
+
+
+def registrar_evento(cliente, usuario_id, evento, exitoso=True):
+    """Registra eventos sin detener la aplicación si falla el historial."""
     try:
-        sb.table("registro_accesos").insert({
-            "usuario_id": uid,
-            "evento": evento,
-            "exitoso": exitoso,
-            "creado_en": ahora(),
+        cliente.table("registro_accesos").insert({
+            "usuario_id": str(usuario_id),
+            "evento": str(evento),
+            "exitoso": bool(exitoso),
         }).execute()
-
-    except Exception as e:
-        st.warning("No se pudo guardar el evento en el historial.")
-        with st.expander("Detalles del historial"):
-            st.code(str(e)[:1000])
+    except Exception:
+        # El fallo del historial no debe bloquear el registro principal.
+        pass
 
 
-def perfil_usuario(sb, uid):
+def obtener_perfil(cliente, usuario_id):
     respuesta = (
-        sb.table("perfiles")
-        .select("id,nombre,rol")
-        .eq("id", uid)
+        cliente.table("perfiles")
+        .select("id, nombre, rol")
+        .eq("id", str(usuario_id))
         .limit(1)
         .execute()
     )
-    return respuesta.data[0] if respuesta.data else None
+
+    if respuesta.data:
+        return respuesta.data[0]
+
+    return None
 
 
-def error_seguro(titulo, error):
-    st.error(titulo)
-    with st.expander("Detalles técnicos (copia este texto si necesitas ayuda)"):
-        st.code(str(error)[:1800])
-
-
-def cargar_votantes(sb):
+def cargar_votantes(cliente):
+    """Consulta los registros de votantes."""
     respuesta = (
-        sb.table("votantes")
-        .select(
-            "id,nombre,apellido_paterno,apellido_materno,edad,curp,domicilio,"
-            "seccion_municipal,afiliacion_partido,creado_en"
-        )
-        .order("creado_en", desc=True)
+        cliente.table("votantes")
+        .select("*")
+        .order("id", desc=True)
         .execute()
     )
+
     return pd.DataFrame(respuesta.data or [])
 
 
-st.title("📊 Sistema de Registro de Votantes")
+def mostrar_error(mensaje, error=None):
+    st.error(mensaje)
+    if error is not None:
+        with st.expander("Detalles técnicos del error"):
+            st.exception(error)
 
 
-# -------------------------------------------------------------------
-# INICIO DE SESIÓN
-# -------------------------------------------------------------------
-if not st.session_state.get("access_token"):
-    st.subheader("🔐 Inicio de sesión")
-    st.info(
-        "Ingresa con el correo electrónico y la contraseña de tu cuenta."
-    )
+# =========================================================
+# INICIALIZACIÓN DE LA SESIÓN
+# =========================================================
 
-    with st.form("login"):
-        correo = st.text_input("Correo electrónico")
-        password = st.text_input("Contraseña", type="password")
-        entrar = st.form_submit_button(
-            "Iniciar sesión",
-            type="primary",
+if "sb" not in st.session_state:
+    st.session_state.sb = None
+
+if "usuario" not in st.session_state:
+    st.session_state.usuario = None
+
+if "perfil" not in st.session_state:
+    st.session_state.perfil = None
+
+
+# =========================================================
+# PANTALLA DE INICIO DE SESIÓN
+# =========================================================
+
+if st.session_state.sb is None or st.session_state.usuario is None:
+
+    st.title("📊 Sistema de Registro de Votantes")
+    st.write("Inicia sesión para acceder al sistema.")
+
+    with st.form("formulario_login"):
+        correo = st.text_input(
+            "Correo electrónico",
+            key="login_correo",
         )
 
-    if entrar:
-        if not correo.strip() or not password:
-            st.error("Escribe el correo electrónico y la contraseña.")
+        contrasena = st.text_input(
+            "Contraseña",
+            type="password",
+            key="login_password",
+        )
+
+        iniciar = st.form_submit_button(
+            "Iniciar sesión",
+            use_container_width=True,
+        )
+
+    if iniciar:
+        if not correo.strip() or not contrasena:
+            st.warning("Escribe tu correo y contraseña.")
         else:
             try:
-                url, key = config()
-                cliente_auth = create_client(url, key)
+                cliente = nuevo_cliente()
 
-                respuesta = cliente_auth.auth.sign_in_with_password({
+                respuesta = cliente.auth.sign_in_with_password({
                     "email": correo.strip(),
-                    "password": password,
+                    "password": contrasena,
                 })
 
-                sesion = respuesta.session
                 usuario = respuesta.user
 
-                if not sesion or not usuario:
+                if not usuario:
+                    raise RuntimeError(
+                        "Supabase no devolvió los datos del usuario."
+                    )
+
+                perfil = obtener_perfil(
+                    cliente,
+                    usuario.id,
+                )
+
+                if not perfil:
+                    try:
+                        cliente.auth.sign_out()
+                    except Exception:
+                        pass
+
                     st.error(
-                        "Supabase no devolvió una sesión. Comprueba "
-                        "el correo, la contraseña y la confirmación de cuenta."
+                        "Tu cuenta no tiene un perfil asignado. "
+                        "Solicita al administrador que la configure."
                     )
-                else:
-                    st.session_state["access_token"] = sesion.access_token
-                    st.session_state["refresh_token"] = sesion.refresh_token
-                    st.session_state["usuario_id"] = str(usuario.id)
-                    st.session_state["correo"] = (
-                        usuario.email or correo.strip()
-                    )
-                    st.session_state["registrar_inicio"] = True
-                    st.rerun()
+                    st.stop()
+
+                if perfil.get("rol") not in ("admin", "consulta"):
+                    st.error("Tu cuenta tiene un rol no válido.")
+                    st.stop()
+
+                st.session_state.sb = cliente
+                st.session_state.usuario = usuario
+                st.session_state.perfil = perfil
+
+                registrar_evento(
+                    cliente,
+                    usuario.id,
+                    "INICIO DE SESIÓN",
+                )
+
+                st.rerun()
 
             except Exception as e:
-                error_seguro(
-                    "No se pudo iniciar sesión. Revisa las credenciales "
-                    "y la configuración de Supabase.",
+                mostrar_error(
+                    "No se pudo iniciar sesión. Revisa el correo, "
+                    "la contraseña y la configuración de Supabase.",
                     e,
                 )
 
     st.stop()
 
 
-# -------------------------------------------------------------------
-# SESIÓN Y PERFIL
-# -------------------------------------------------------------------
-try:
-    sb = nuevo_cliente()
+# =========================================================
+# DATOS DEL USUARIO AUTENTICADO
+# =========================================================
 
-except Exception as e:
-    error_seguro(
-        "La sesión no se pudo restaurar. Cierra sesión e inténtalo de nuevo.",
-        e,
-    )
+sb = st.session_state.sb
+usuario = st.session_state.usuario
+perfil = st.session_state.perfil
 
-    if st.button("Limpiar sesión y volver al inicio"):
-        for clave in (
-            "access_token",
-            "refresh_token",
-            "usuario_id",
-            "correo",
-            "registrar_inicio",
-        ):
-            st.session_state.pop(clave, None)
-        st.rerun()
-
-    st.stop()
-
-
-uid = st.session_state.get("usuario_id")
-correo = st.session_state.get("correo", "")
-
-if not uid:
-    st.error("No se encontró el identificador del usuario.")
-
-    if st.button("Volver al inicio de sesión"):
-        st.session_state.clear()
-        st.rerun()
-
-    st.stop()
-
-
-try:
-    perfil = perfil_usuario(sb, uid)
-
-except Exception as e:
-    error_seguro(
-        "No se pudo consultar el perfil en public.perfiles.",
-        e,
-    )
-
-    if st.button("Cerrar sesión y volver a intentar"):
-        st.session_state.clear()
-        st.rerun()
-
-    st.stop()
-
-
-if not perfil:
-    st.error(
-        "La cuenta inició sesión, pero no tiene un perfil en public.perfiles "
-        "con el mismo UUID que Authentication → Users."
-    )
-
-    if st.button("Cerrar sesión"):
-        st.session_state.clear()
-        st.rerun()
-
-    st.stop()
-
-
+uid = str(usuario.id)
+nombre_usuario = perfil.get("nombre") or usuario.email or "Usuario"
 rol = perfil.get("rol", "consulta")
 admin = rol == "admin"
 
 
-if st.session_state.pop("registrar_inicio", False):
-    registrar_evento(sb, uid, "INICIO DE SESIÓN EXITOSO")
+# Actualiza el perfil por si cambió el rol en la base de datos.
+try:
+    perfil_actualizado = obtener_perfil(sb, uid)
+
+    if perfil_actualizado:
+        perfil = perfil_actualizado
+        st.session_state.perfil = perfil
+        rol = perfil.get("rol", "consulta")
+        admin = rol == "admin"
+
+except Exception:
+    pass
 
 
-st.sidebar.success(f"Sesión: {perfil.get('nombre') or correo}")
-st.sidebar.caption(f"Rol: {rol}")
+# =========================================================
+# MENÚ PRINCIPAL
+# =========================================================
 
+st.sidebar.title("📊 Sistema de Votantes")
+st.sidebar.write(f"**Usuario:** {nombre_usuario}")
+st.sidebar.write(f"**Rol:** {rol}")
 
-if st.sidebar.button("Cerrar sesión"):
-    registrar_evento(sb, uid, "CIERRE DE SESIÓN")
-    st.session_state.clear()
-    st.rerun()
-
-
-# -------------------------------------------------------------------
-# MENÚ SEGÚN EL ROL
-# -------------------------------------------------------------------
 if admin:
-    menu = [
+    opciones = [
         "Inicio",
         "Registrar persona",
         "Consultar registros",
@@ -285,354 +291,460 @@ if admin:
         "Historial de accesos",
     ]
 else:
-    menu = [
+    opciones = [
         "Inicio",
         "Consultar registros",
         "Gráfica de registros",
     ]
 
-
-opcion = st.sidebar.radio("Menú", menu)
-
-
-# -------------------------------------------------------------------
-# CARGA DE REGISTROS
-# -------------------------------------------------------------------
-try:
-    datos = cargar_votantes(sb)
-
-except Exception as e:
-    error_seguro(
-        "No se pudieron consultar los registros de votantes.",
-        e,
-    )
-    st.stop()
+opcion = st.sidebar.radio(
+    "Selecciona una opción",
+    opciones,
+)
 
 
-# -------------------------------------------------------------------
-# PANTALLA: INICIO
-# -------------------------------------------------------------------
+if st.sidebar.button("Cerrar sesión", use_container_width=True):
+    try:
+        registrar_evento(
+            sb,
+            uid,
+            "CIERRE DE SESIÓN",
+        )
+        sb.auth.sign_out()
+    except Exception:
+        pass
+
+    st.session_state.sb = None
+    st.session_state.usuario = None
+    st.session_state.perfil = None
+
+    st.rerun()
+
+
+# =========================================================
+# INICIO
+# =========================================================
+
 if opcion == "Inicio":
-    st.subheader("Panel principal")
 
-    c1, c2 = st.columns(2)
+    st.title("Bienvenido al Sistema de Registro de Votantes")
 
-    c1.metric("Personas registradas", len(datos))
-
-    c2.metric(
-        "Categorías de partido",
-        datos["afiliacion_partido"].nunique() if not datos.empty else 0,
+    st.write(
+        "Desde este sistema puedes consultar los registros "
+        "y revisar las gráficas disponibles."
     )
 
-    if not datos.empty:
-        vista = datos.drop(
-            columns=["curp", "domicilio"],
-            errors="ignore",
-        ).rename(columns={
-            "id": "ID",
-            "nombre": "Nombre",
-            "apellido_paterno": "Apellido paterno",
-            "apellido_materno": "Apellido materno",
-            "edad": "Edad",
-            "seccion_municipal": "Sección",
-            "afiliacion_partido": "Partido asociado",
-            "creado_en": "Fecha de registro",
-        })
-
-        st.dataframe(
-            vista,
-            use_container_width=True,
-            hide_index=True,
+    if admin:
+        st.info(
+            "Tu cuenta tiene permisos de administrador. "
+            "Puedes registrar personas, eliminar registros "
+            "y administrar perfiles."
         )
     else:
-        st.info("Todavía no hay registros.")
+        st.info(
+            "Tu cuenta tiene permisos de consulta. "
+            "Las opciones de administración están restringidas."
+        )
+
+    try:
+        df_inicio = cargar_votantes(sb)
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.metric(
+                "Total de registros",
+                len(df_inicio),
+            )
+
+        with col2:
+            if "partido" in df_inicio.columns:
+                st.metric(
+                    "Partidos o categorías",
+                    df_inicio["partido"].nunique(),
+                )
+            else:
+                st.metric("Partidos o categorías", "N/D")
+
+    except Exception as e:
+        mostrar_error(
+            "No se pudieron consultar los registros.",
+            e,
+        )
 
 
-# -------------------------------------------------------------------
-# PANTALLA: REGISTRAR PERSONA (SOLO ADMIN)
-# -------------------------------------------------------------------
+# =========================================================
+# REGISTRAR PERSONA — SOLO ADMINISTRADOR
+# =========================================================
+
 elif opcion == "Registrar persona" and admin:
-    st.subheader("Registrar persona")
 
-    st.warning(
-        "CURP, domicilio y afiliación política son datos personales delicados. "
-        "Utiliza datos ficticios durante las pruebas y protege los datos reales."
-    )
+    st.title("📝 Registrar persona")
 
-    with st.form("registro"):
-        nombre = st.text_input("Nombre")
-        paterno = st.text_input("Apellido paterno")
-        materno = st.text_input("Apellido materno (opcional)")
-        edad = st.number_input(
-            "Edad",
-            min_value=18,
-            max_value=120,
-            value=18,
-        )
-        curp = st.text_input("CURP", max_chars=18).strip().upper()
-        domicilio = st.text_input("Domicilio")
-        seccion = st.text_input("Sección electoral")
-        partido = st.selectbox("Partido asociado al registro", PARTIDOS)
-        otro = (
-            st.text_input("Nombre del partido")
-            if partido == "Otro"
-            else ""
-        )
+    with st.form("formulario_votante"):
 
-        autorizacion = st.checkbox(
-            "Tengo autorización para guardar estos datos."
-        )
+        col1, col2 = st.columns(2)
+
+        with col1:
+            nombre = st.text_input("Nombre(s)")
+            apellido_paterno = st.text_input("Apellido paterno")
+            apellido_materno = st.text_input("Apellido materno")
+            edad = st.number_input(
+                "Edad",
+                min_value=18,
+                max_value=120,
+                value=18,
+                step=1,
+            )
+
+        with col2:
+            curp = st.text_input(
+                "CURP",
+                max_chars=18,
+            )
+            domicilio = st.text_area("Domicilio")
+            seccion = st.text_input("Sección electoral")
+            partido = st.selectbox(
+                "Partido o categoría",
+                PARTIDOS,
+            )
 
         guardar = st.form_submit_button(
-            "Guardar persona",
-            type="primary",
+            "Guardar registro",
+            use_container_width=True,
         )
 
     if guardar:
-        if not nombre.strip() or not paterno.strip():
-            st.error("Escribe el nombre y el apellido paterno.")
-        elif len(curp) != 18:
+
+        if not nombre.strip():
+            st.error("El nombre es obligatorio.")
+
+        elif not apellido_paterno.strip():
+            st.error("El apellido paterno es obligatorio.")
+
+        elif not curp.strip():
+            st.error("La CURP es obligatoria.")
+
+        elif len(curp.strip()) != 18:
             st.error("La CURP debe tener 18 caracteres.")
+
+        elif not domicilio.strip():
+            st.error("El domicilio es obligatorio.")
+
         elif not seccion.strip():
-            st.error("Escribe la sección electoral.")
-        elif partido == "Otro" and not otro.strip():
-            st.error("Escribe el nombre del partido.")
-        elif not autorizacion:
-            st.error("Confirma que tienes autorización.")
+            st.error("La sección electoral es obligatoria.")
+
         else:
-            fila = {
+            datos = {
                 "nombre": nombre.strip(),
-                "apellido_paterno": paterno.strip(),
-                "apellido_materno": materno.strip() or None,
+                "apellido_paterno": apellido_paterno.strip(),
+                "apellido_materno": apellido_materno.strip(),
                 "edad": int(edad),
-                "curp": curp,
-                "domicilio": domicilio.strip() or None,
-                "seccion_municipal": seccion.strip() or None,
-                "afiliacion_partido": (
-                    otro.strip() if partido == "Otro" else partido
-                ),
+                "curp": curp.strip().upper(),
+                "domicilio": domicilio.strip(),
+                "seccion": seccion.strip(),
+                "partido": partido,
                 "creado_por": uid,
             }
 
             try:
-                sb.table("votantes").insert(fila).execute()
-                st.success("Persona guardada en Supabase.")
+                sb.table("votantes").insert(datos).execute()
+
+                registrar_evento(
+                    sb,
+                    uid,
+                    "REGISTRO DE PERSONA",
+                )
+
+                st.success("La persona se registró correctamente.")
                 st.rerun()
 
             except Exception as e:
-                if "23505" in str(e) or "duplicate" in str(e).lower():
-                    st.error("Ya existe un registro con esa CURP.")
-                else:
-                    error_seguro("No se pudo guardar la persona.", e)
+                mostrar_error(
+                    "No se pudo guardar el registro. "
+                    "Comprueba los campos de la tabla votantes "
+                    "y sus permisos en Supabase.",
+                    e,
+                )
 
 
-# -------------------------------------------------------------------
-# PANTALLA: CONSULTAR REGISTROS
-# -------------------------------------------------------------------
+# =========================================================
+# CONSULTAR REGISTROS
+# =========================================================
+
 elif opcion == "Consultar registros":
-    st.subheader("Consultar personas")
 
-    if datos.empty:
-        st.info("No hay registros.")
-    else:
-        buscar = st.text_input(
-            "Buscar por nombre, apellido o sección"
-        )
+    st.title("🔎 Consultar registros")
 
-        mascara = pd.Series(False, index=datos.index)
+    try:
+        df = cargar_votantes(sb)
 
-        for columna in [
-            "nombre",
-            "apellido_paterno",
-            "apellido_materno",
-            "seccion_municipal",
-        ]:
-            mascara |= (
-                datos[columna]
-                .fillna("")
-                .astype(str)
-                .str.contains(buscar, case=False, regex=False)
+        if df.empty:
+            st.info("Todavía no hay personas registradas.")
+        else:
+            busqueda = st.text_input(
+                "Buscar por nombre, apellidos o CURP"
             )
 
-        filtrados = datos[mascara] if buscar else datos
+            if busqueda.strip():
+                termino = busqueda.strip().lower()
 
-        vista = filtrados.rename(columns={
-            "id": "ID",
-            "nombre": "Nombre",
-            "apellido_paterno": "Apellido paterno",
-            "apellido_materno": "Apellido materno",
-            "edad": "Edad",
-            "curp": "CURP",
-            "domicilio": "Domicilio",
-            "seccion_municipal": "Sección",
-            "afiliacion_partido": "Partido asociado",
-            "creado_en": "Fecha de registro",
-        })
-
-        st.dataframe(
-            vista,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.download_button(
-            "Descargar resultados CSV",
-            filtrados.to_csv(index=False).encode("utf-8-sig"),
-            "registros_votantes.csv",
-            "text/csv",
-        )
-
-
-# -------------------------------------------------------------------
-# PANTALLA: GRÁFICA DE REGISTROS
-# -------------------------------------------------------------------
-elif opcion == "Gráfica de registros":
-    st.subheader("Cantidad de registros por partido asociado")
-
-    if datos.empty:
-        st.info("Registra personas para generar la gráfica.")
-    else:
-        conteo = (
-            datos["afiliacion_partido"]
-            .fillna("Sin especificar")
-            .replace("", "Sin especificar")
-            .value_counts()
-            .rename_axis("Partido")
-            .reset_index(name="Cantidad")
-        )
-
-        st.bar_chart(
-            conteo,
-            x="Partido",
-            y="Cantidad",
-            x_label="Partido asociado",
-            y_label="Cantidad de registros",
-        )
-
-        st.subheader("Detalle de registros por partido")
-
-        st.dataframe(
-            conteo,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.caption(
-            "La gráfica muestra registros administrativos, "
-            "no votos emitidos ni resultados oficiales."
-        )
-
-
-# -------------------------------------------------------------------
-# PANTALLA: ELIMINAR PERSONA (SOLO ADMIN)
-# -------------------------------------------------------------------
-elif opcion == "Eliminar persona" and admin:
-    st.subheader("Eliminar registro (solo administrador)")
-
-    if datos.empty:
-        st.info("No hay registros que eliminar.")
-    else:
-        etiquetas = {}
-
-        for _, fila in datos.iterrows():
-            nombre_completo = " ".join(
-                str(fila.get(columna) or "")
-                for columna in [
-                    "nombre",
-                    "apellido_paterno",
-                    "apellido_materno",
+                columnas_busqueda = [
+                    columna
+                    for columna in [
+                        "nombre",
+                        "apellido_paterno",
+                        "apellido_materno",
+                        "curp",
+                    ]
+                    if columna in df.columns
                 ]
-            ).strip()
 
-            etiquetas[
-                f"{nombre_completo} | Sección "
-                f"{fila.get('seccion_municipal') or ''} | ID {fila['id']}"
-            ] = fila["id"]
-
-        elegido = st.selectbox(
-            "Selecciona el registro",
-            list(etiquetas.keys()),
-        )
-
-        confirmar = st.checkbox(
-            "Confirmo que deseo eliminar este registro."
-        )
-
-        if st.button("Eliminar registro", type="primary"):
-            if not confirmar:
-                st.warning("Confirma la eliminación.")
-            else:
-                try:
-                    sb.table("votantes").delete().eq(
-                        "id",
-                        etiquetas[elegido],
-                    ).execute()
-
-                    st.success("Registro eliminado.")
-                    st.rerun()
-
-                except Exception as e:
-                    error_seguro(
-                        "No se pudo eliminar el registro.",
-                        e,
+                if columnas_busqueda:
+                    mascara = pd.Series(
+                        False,
+                        index=df.index,
                     )
 
+                    for columna in columnas_busqueda:
+                        mascara = mascara | (
+                            df[columna]
+                            .fillna("")
+                            .astype(str)
+                            .str.lower()
+                            .str.contains(
+                                termino,
+                                regex=False,
+                            )
+                        )
 
-# -------------------------------------------------------------------
-# PANTALLA: ADMINISTRAR PERFILES (SOLO ADMIN)
-# -------------------------------------------------------------------
+                    df = df[mascara]
+
+            st.write(f"Registros encontrados: **{len(df)}**")
+            st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            csv = df.to_csv(index=False).encode("utf-8-sig")
+
+            st.download_button(
+                "Descargar resultados en CSV",
+                data=csv,
+                file_name="registros_votantes.csv",
+                mime="text/csv",
+            )
+
+    except Exception as e:
+        mostrar_error(
+            "No se pudieron consultar los registros de votantes.",
+            e,
+        )
+
+
+# =========================================================
+# GRÁFICA DE REGISTROS
+# =========================================================
+
+elif opcion == "Gráfica de registros":
+
+    st.title("📈 Gráfica de registros")
+
+    try:
+        df = cargar_votantes(sb)
+
+        if df.empty:
+            st.info("No hay datos suficientes para crear la gráfica.")
+
+        elif "partido" not in df.columns:
+            st.error(
+                "No se encontró la columna 'partido' "
+                "en la tabla votantes."
+            )
+
+        else:
+            conteo = (
+                df["partido"]
+                .fillna("Sin especificar")
+                .astype(str)
+                .value_counts()
+            )
+
+            st.subheader("Registros por partido o categoría")
+            st.bar_chart(conteo)
+
+            st.subheader("Resumen")
+            resumen = conteo.rename_axis("Partido").reset_index(
+                name="Cantidad"
+            )
+
+            st.dataframe(
+                resumen,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    except Exception as e:
+        mostrar_error(
+            "No se pudo generar la gráfica.",
+            e,
+        )
+
+
+# =========================================================
+# ELIMINAR PERSONA — SOLO ADMINISTRADOR
+# =========================================================
+
+elif opcion == "Eliminar persona" and admin:
+
+    st.title("🗑️ Eliminar persona")
+
+    st.warning(
+        "Esta acción elimina un registro de la base de datos "
+        "y no se puede deshacer desde esta pantalla."
+    )
+
+    try:
+        df = cargar_votantes(sb)
+
+        if df.empty:
+            st.info("No hay registros para eliminar.")
+
+        elif "id" not in df.columns:
+            st.error(
+                "No se encontró la columna 'id' en la tabla votantes."
+            )
+
+        else:
+            opciones_ids = df["id"].tolist()
+
+            def etiqueta_persona(id_persona):
+                fila = df[df["id"] == id_persona].iloc[0]
+
+                nombre_completo = " ".join(
+                    str(fila.get(campo, "") or "")
+                    for campo in [
+                        "nombre",
+                        "apellido_paterno",
+                        "apellido_materno",
+                    ]
+                ).strip()
+
+                return f"ID {id_persona} — {nombre_completo}"
+
+            id_seleccionado = st.selectbox(
+                "Selecciona el registro",
+                opciones_ids,
+                format_func=etiqueta_persona,
+            )
+
+            confirmar = st.checkbox(
+                "Confirmo que deseo eliminar este registro."
+            )
+
+            if st.button(
+                "Eliminar registro",
+                type="primary",
+            ):
+                if not confirmar:
+                    st.error(
+                        "Marca la casilla de confirmación antes de eliminar."
+                    )
+                else:
+                    sb.table("votantes").delete().eq(
+                        "id",
+                        id_seleccionado,
+                    ).execute()
+
+                    registrar_evento(
+                        sb,
+                        uid,
+                        f"ELIMINÓ REGISTRO ID {id_seleccionado}",
+                    )
+
+                    st.success("Registro eliminado correctamente.")
+                    st.rerun()
+
+    except Exception as e:
+        mostrar_error(
+            "No se pudo eliminar el registro.",
+            e,
+        )
+
+
+# =========================================================
+# ADMINISTRAR PERFILES — SOLO ADMINISTRADOR
+# =========================================================
+
 elif opcion == "Administrar perfiles" and admin:
-    st.subheader("Administrar usuarios")
 
+    st.title("👥 Administrar perfiles")
     st.write(
-        "Desde aquí puedes crear cuentas para que otras personas "
-        "inicien sesión en la aplicación."
+        "Desde aquí puedes crear cuentas y asignarles un rol."
     )
 
-    st.info(
-        "Comparte las credenciales iniciales de forma privada. "
-        "No compartas contraseñas por canales públicos."
-    )
+    st.subheader("Crear cuenta")
 
-    with st.form("crear_usuario"):
-        nombre_nuevo = st.text_input("Nombre del usuario")
-        correo_nuevo = st.text_input("Correo electrónico")
+    with st.form("formulario_nuevo_usuario"):
+
+        nombre_nuevo = st.text_input(
+            "Nombre del usuario",
+            key="nombre_nuevo",
+        )
+
+        correo_nuevo = st.text_input(
+            "Correo electrónico",
+            key="correo_nuevo",
+        )
+
         password_nuevo = st.text_input(
-            "Contraseña inicial (mínimo 8 caracteres)",
+            "Contraseña inicial",
             type="password",
+            key="password_nuevo",
         )
 
         rol_nuevo = st.selectbox(
-            "Rol del usuario",
+            "Rol de la cuenta",
             ["consulta", "admin"],
-            format_func=lambda r: (
-                "Consulta (solo lectura)"
-                if r == "consulta"
-                else "Administrador"
+            format_func=lambda x: (
+                "Consulta" if x == "consulta" else "Administrador"
             ),
+            key="rol_nuevo",
         )
 
         crear = st.form_submit_button(
-            "Crear usuario",
-            type="primary",
+            "Crear cuenta",
+            use_container_width=True,
         )
 
+    # -----------------------------------------------------
+    # VALIDACIÓN Y CREACIÓN DE LA CUENTA
+    # -----------------------------------------------------
+
     if crear:
+
         if not nombre_nuevo.strip():
             st.error("Escribe el nombre del usuario.")
 
-        elif not correo_nuevo.strip() or "@" not in correo_nuevo:
+        elif (
+            not correo_nuevo.strip()
+            or "@" not in correo_nuevo
+        ):
             st.error("Escribe un correo electrónico válido.")
 
         elif len(password_nuevo) < 8:
-            st.error("La contraseña debe tener al menos 8 caracteres.")
+            st.error(
+                "La contraseña debe tener al menos 8 caracteres."
+            )
 
         else:
             usuario_nuevo = None
             cliente_privado = None
+            creacion_exitosa = False
 
             try:
-                # La clave privada solo se usa del lado del servidor.
+                # Se necesita una clave administrativa, no la Publishable.
                 cliente_privado = cliente_administrador()
 
                 respuesta = cliente_privado.auth.admin.create_user({
@@ -651,116 +763,147 @@ elif opcion == "Administrar perfiles" and admin:
                         "Supabase no devolvió el usuario creado."
                     )
 
-                # Crear el perfil asociado al UUID de Auth.
-                cliente_privado.table("perfiles").insert({
-                    "id": str(usuario_nuevo.id),
-                    "nombre": nombre_nuevo.strip(),
-                    "rol": rol_nuevo,
-                }).execute()
+                # Crear el perfil asociado al usuario de Auth.
+                try:
+                    cliente_privado.table("perfiles").insert({
+                        "id": str(usuario_nuevo.id),
+                        "nombre": nombre_nuevo.strip(),
+                        "rol": rol_nuevo,
+                    }).execute()
 
-                registrar_evento(
-                    sb,
-                    uid,
-                    f"ADMIN CREÓ CUENTA CON ROL {rol_nuevo}",
-                )
-
-                st.success(
-                    f"Cuenta creada correctamente para "
-                    f"{correo_nuevo.strip()}."
-                )
-
-                st.info(
-                    "La cuenta quedó confirmada y puede intentar iniciar "
-                    "sesión con el correo y la contraseña inicial."
-                )
-
-                st.rerun()
-
-            except Exception as e:
-                # Si Auth creó la cuenta pero falló la creación del perfil,
-                # intentamos eliminar la cuenta incompleta.
-                if usuario_nuevo and cliente_privado:
+                except Exception:
+                    # Si falla el perfil, intenta deshacer la cuenta
+                    # recién creada para no dejar un usuario incompleto.
                     try:
                         cliente_privado.auth.admin.delete_user(
                             str(usuario_nuevo.id)
                         )
                     except Exception:
                         st.warning(
-                            "No se pudo revertir automáticamente la cuenta. "
-                            "Revisa Authentication → Users y public.perfiles "
-                            "antes de volver a intentar."
+                            "No se pudo eliminar automáticamente "
+                            "la cuenta incompleta. Revisa Authentication "
+                            "→ Users y la tabla public.perfiles."
                         )
 
-            st.error("Error al crear la cuenta")
-st.exception(e)
+                    raise
 
-    # Esta sección queda fuera del try/except de creación.
+                # El registro del historial no debe invalidar la cuenta.
+                registrar_evento(
+                    sb,
+                    uid,
+                    f"ADMIN CREÓ CUENTA CON ROL {rol_nuevo}",
+                )
+
+                creacion_exitosa = True
+
+            except Exception as e:
+                mostrar_error(
+                    "No se pudo completar la creación de la cuenta. "
+                    "Comprueba la clave administrativa, el correo "
+                    "y las tablas de Supabase.",
+                    e,
+                )
+
+            # El rerun se ejecuta FUERA del try/except para evitar
+            # que una actualización de Streamlit se trate como error.
+            if creacion_exitosa:
+                st.success(
+                    f"Cuenta creada correctamente para "
+                    f"{correo_nuevo.strip()}."
+                )
+                st.rerun()
+
+    # -----------------------------------------------------
+    # LISTADO DE PERFILES
+    # Esta sección queda fuera del if crear.
+    # -----------------------------------------------------
+
     st.divider()
     st.subheader("Usuarios registrados")
 
     try:
-        perfiles = (
+        respuesta_perfiles = (
             sb.table("perfiles")
-            .select("id,nombre,rol,creado_en")
-            .order("creado_en", desc=True)
+            .select("id, nombre, rol, creado_en")
+            .order("nombre")
             .execute()
-            .data
-            or []
         )
 
-        if perfiles:
+        perfiles_df = pd.DataFrame(
+            respuesta_perfiles.data or []
+        )
+
+        if perfiles_df.empty:
+            st.info("No hay perfiles para mostrar.")
+        else:
             st.dataframe(
-                pd.DataFrame(perfiles),
+                perfiles_df,
                 use_container_width=True,
                 hide_index=True,
             )
-        else:
-            st.info("Todavía no hay perfiles.")
 
     except Exception as e:
-        error_seguro(
-            "No se pudieron consultar los perfiles.",
+        mostrar_error(
+            "No se pudieron consultar los perfiles. "
+            "Comprueba que la tabla perfiles tenga las columnas "
+            "id, nombre, rol y creado_en.",
             e,
         )
 
 
-# -------------------------------------------------------------------
-# PANTALLA: HISTORIAL DE ACCESOS (SOLO ADMIN)
-# -------------------------------------------------------------------
+# =========================================================
+# HISTORIAL DE ACCESOS — SOLO ADMINISTRADOR
+# =========================================================
+
 elif opcion == "Historial de accesos" and admin:
-    st.subheader("Historial de accesos (solo administrador)")
+
+    st.title("🕘 Historial de accesos")
 
     try:
-        eventos = (
+        respuesta_historial = (
             sb.table("registro_accesos")
-            .select("id,usuario_id,evento,exitoso,creado_en")
-            .order("creado_en", desc=True)
+            .select("*")
+            .order("id", desc=True)
             .limit(500)
             .execute()
-            .data
-            or []
         )
 
-        if eventos:
-            df = pd.DataFrame(eventos)
+        historial_df = pd.DataFrame(
+            respuesta_historial.data or []
+        )
 
+        if historial_df.empty:
+            st.info("Todavía no hay eventos en el historial.")
+        else:
             st.dataframe(
-                df,
+                historial_df,
                 use_container_width=True,
                 hide_index=True,
             )
+
+            csv_historial = historial_df.to_csv(
+                index=False
+            ).encode("utf-8-sig")
 
             st.download_button(
                 "Descargar historial CSV",
-                df.to_csv(index=False).encode("utf-8-sig"),
-                "historial_accesos.csv",
-                "text/csv",
+                data=csv_historial,
+                file_name="historial_accesos.csv",
+                mime="text/csv",
             )
-        else:
-            st.info("Todavía no hay eventos registrados.")
 
     except Exception as e:
-        error_seguro(
-            "No se pudo consultar el historial.",
+        mostrar_error(
+            "No se pudo consultar el historial de accesos.",
             e,
         )
+
+
+# =========================================================
+# CONTROL DE OPCIONES NO AUTORIZADAS
+# =========================================================
+
+else:
+    st.error(
+        "No tienes permisos para acceder a esta sección."
+    )
