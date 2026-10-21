@@ -691,7 +691,7 @@ elif opcion == "Administrar perfiles" and admin:
                             "antes de volver a intentar."
                         )
 
-               st.error("Error al crear la cuenta")
+                st.error("Error al crear la cuenta")
 st.exception(e)
 
     # Esta sección queda fuera del try/except de creación.
