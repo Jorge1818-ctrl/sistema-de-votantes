@@ -391,16 +391,17 @@ elif opcion == "Registrar persona" and admin:
             )
         else:
             try:
-                datos = {
-                    "nombre": nombre.strip(),
-                    "apellido_paterno": apellido_paterno.strip(),
-                    "apellido_materno": apellido_materno.strip(),
-                    "edad": int(edad),
-                    "curp": curp.strip().upper(),
-                    "domicilio": domicilio.strip(),
-                    "seccion": seccion.strip(),
-                    "partido": partido,
-                    "creado_por": str(usuario.id),
+                
+                 datos = {
+                 "nombre": nombre.strip(),
+                 "apellido_paterno": apellido_paterno.strip(),
+                 "apellido_materno": apellido_materno.strip(),
+                 "edad": int(edad),
+                 "curp": curp.strip().upper(),
+                 "domicilio": domicilio.strip(),
+                 "seccion_municipal": seccion.strip(),
+                 "afiliacion_partido": partido,
+                 "creado_por": str(usuario.id),
                 }
 
                 sb.table("votantes").insert(datos).execute()
