@@ -41,15 +41,14 @@ def config():
 
 
 def cliente_administrador():
-    """
-    Cliente privado para crear cuentas mediante Supabase Auth.
-    La clave privada nunca debe mostrarse ni compartirse.
-    """
+    """Cliente privado para operaciones administrativas de Supabase."""
     url, _ = config()
-    clave_privada = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
+    clave_privada = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
     if not clave_privada:
-        raise ValueError("La clave privada de administración está vacía.")
+        raise ValueError(
+            "No se encontró SUPABASE_SERVICE_ROLE_KEY en Streamlit Secrets."
+        )
 
     return create_client(url, clave_privada)
 
@@ -286,7 +285,6 @@ if admin:
         "Historial de accesos",
     ]
 else:
-    # Los usuarios de consulta no reciben opciones administrativas.
     menu = [
         "Inicio",
         "Consultar registros",
@@ -323,11 +321,7 @@ if opcion == "Inicio":
 
     c2.metric(
         "Categorías de partido",
-        (
-            datos["afiliacion_partido"].nunique()
-            if not datos.empty
-            else 0
-        ),
+        datos["afiliacion_partido"].nunique() if not datos.empty else 0,
     )
 
     if not datos.empty:
@@ -350,7 +344,6 @@ if opcion == "Inicio":
             use_container_width=True,
             hide_index=True,
         )
-
     else:
         st.info("Todavía no hay registros.")
 
@@ -398,19 +391,14 @@ elif opcion == "Registrar persona" and admin:
     if guardar:
         if not nombre.strip() or not paterno.strip():
             st.error("Escribe el nombre y el apellido paterno.")
-
         elif len(curp) != 18:
             st.error("La CURP debe tener 18 caracteres.")
-
         elif not seccion.strip():
             st.error("Escribe la sección electoral.")
-
         elif partido == "Otro" and not otro.strip():
             st.error("Escribe el nombre del partido.")
-
         elif not autorizacion:
             st.error("Confirma que tienes autorización.")
-
         else:
             fila = {
                 "nombre": nombre.strip(),
@@ -446,7 +434,6 @@ elif opcion == "Consultar registros":
 
     if datos.empty:
         st.info("No hay registros.")
-
     else:
         buscar = st.text_input(
             "Buscar por nombre, apellido o sección"
@@ -504,7 +491,6 @@ elif opcion == "Gráfica de registros":
 
     if datos.empty:
         st.info("Registra personas para generar la gráfica.")
-
     else:
         conteo = (
             datos["afiliacion_partido"]
@@ -545,7 +531,6 @@ elif opcion == "Eliminar persona" and admin:
 
     if datos.empty:
         st.info("No hay registros que eliminar.")
-
     else:
         etiquetas = {}
 
@@ -576,7 +561,6 @@ elif opcion == "Eliminar persona" and admin:
         if st.button("Eliminar registro", type="primary"):
             if not confirmar:
                 st.warning("Confirma la eliminación.")
-
             else:
                 try:
                     sb.table("votantes").delete().eq(
@@ -599,15 +583,15 @@ elif opcion == "Eliminar persona" and admin:
 # -------------------------------------------------------------------
 elif opcion == "Administrar perfiles" and admin:
     st.subheader("Administrar usuarios")
+
     st.write(
         "Desde aquí puedes crear cuentas para que otras personas "
         "inicien sesión en la aplicación."
     )
 
     st.info(
-        "La cuenta nueva podrá iniciar sesión con el correo y la "
-        "contraseña inicial que le proporciones. Comparte la contraseña "
-        "de manera privada y pide al usuario que la cambie."
+        "Comparte las credenciales iniciales de forma privada. "
+        "No compartas contraseñas por canales públicos."
     )
 
     with st.form("crear_usuario"):
@@ -645,9 +629,10 @@ elif opcion == "Administrar perfiles" and admin:
 
         else:
             usuario_nuevo = None
+            cliente_privado = None
 
             try:
-                # Cliente de servidor privado, solo usado en esta acción.
+                # La clave privada solo se usa del lado del servidor.
                 cliente_privado = cliente_administrador()
 
                 respuesta = cliente_privado.auth.admin.create_user({
@@ -666,7 +651,7 @@ elif opcion == "Administrar perfiles" and admin:
                         "Supabase no devolvió el usuario creado."
                     )
 
-                # Vincula el perfil al UUID generado por Supabase Auth.
+                # Crear el perfil asociado al UUID de Auth.
                 cliente_privado.table("perfiles").insert({
                     "id": str(usuario_nuevo.id),
                     "nombre": nombre_nuevo.strip(),
@@ -685,33 +670,32 @@ elif opcion == "Administrar perfiles" and admin:
                 )
 
                 st.info(
-                    "La cuenta está confirmada. El usuario ya puede "
-                    "intentar iniciar sesión con su correo y contraseña."
+                    "La cuenta quedó confirmada y puede intentar iniciar "
+                    "sesión con el correo y la contraseña inicial."
                 )
 
                 st.rerun()
 
- 
-except Exception as e:
-    # Evita dejar una cuenta huérfana si Auth la creó,
-    # pero falló la creación de su perfil.
-    if usuario_nuevo:
-        try:
-            cliente_privado.auth.admin.delete_user(
-                str(usuario_nuevo.id)
-            )
-        except Exception:
-            st.warning(
-                "No se pudo revertir automáticamente la cuenta. "
-                "Revisa Authentication → Users y public.perfiles "
-                "antes de volver a intentar."
-            )
+            except Exception as e:
+                # Si Auth creó la cuenta pero falló la creación del perfil,
+                # intentamos eliminar la cuenta incompleta.
+                if usuario_nuevo and cliente_privado:
+                    try:
+                        cliente_privado.auth.admin.delete_user(
+                            str(usuario_nuevo.id)
+                        )
+                    except Exception:
+                        st.warning(
+                            "No se pudo revertir automáticamente la cuenta. "
+                            "Revisa Authentication → Users y public.perfiles "
+                            "antes de volver a intentar."
+                        )
 
-    st.error("No se pudo completar la creación de la cuenta.")
-    st.write("Detalle técnico del error:")
-    st.code(str(e))
+                st.error("No se pudo completar la creación de la cuenta.")
+                st.write("Detalle técnico del error:")
+                st.code(str(e)[:1800])
 
-
+    # Esta sección queda fuera del try/except de creación.
     st.divider()
     st.subheader("Usuarios registrados")
 
@@ -773,7 +757,6 @@ elif opcion == "Historial de accesos" and admin:
                 "historial_accesos.csv",
                 "text/csv",
             )
-
         else:
             st.info("Todavía no hay eventos registrados.")
 
