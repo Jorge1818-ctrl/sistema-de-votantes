@@ -22,10 +22,11 @@ st.set_page_config(
 TZ = ZoneInfo("America/Mexico_City")
 
 PARTIDOS = [
-    "Partido A",
-    "Partido B",
-    "Partido C",
-    "Otro",
+    "PRI",
+    "PAN",
+    "PRD",
+    "Morena",
+    "Movimiento Naranja",
     "Ninguno",
 ]
 
