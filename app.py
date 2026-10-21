@@ -691,9 +691,8 @@ elif opcion == "Administrar perfiles" and admin:
                             "antes de volver a intentar."
                         )
 
-                st.error("No se pudo completar la creación de la cuenta.")
-                st.write("Detalle técnico del error:")
-                st.code(str(e)[:1800])
+               st.error("Error al crear la cuenta")
+st.exception(e)
 
     # Esta sección queda fuera del try/except de creación.
     st.divider()
