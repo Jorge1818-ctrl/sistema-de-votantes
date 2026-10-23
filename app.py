@@ -1153,11 +1153,11 @@ elif opcion == "Gráfica de registros":
 # =========================================================
 
 elif opcion == "Eliminar persona" and admin:
-    st.title("Eliminar persona")
+    st.title("🗑️ Eliminar persona")
+    st.write("Busca a la persona en la tabla y utiliza el botón de su fila para eliminarla.")
 
     st.warning(
-        "La eliminación es permanente. "
-        "Comprueba el registro antes de confirmar."
+        "La eliminación es permanente. Revisa bien el registro y confirma antes de borrarlo."
     )
 
     try:
@@ -1165,55 +1165,178 @@ elif opcion == "Eliminar persona" and admin:
 
         if df.empty:
             st.info("No hay registros para eliminar.")
+            st.session_state.pop("votante_pendiente_eliminar", None)
 
         else:
-            nombres = (
-                df["id"].astype(str)
-                + " — "
-                + df["nombre"].fillna("").astype(str)
-                + " "
-                + df["apellido_paterno"].fillna("").astype(str)
+            # Buscador: permite localizar registros sin mostrar toda la CURP.
+            busqueda_eliminar = st.text_input(
+                "🔎 Buscar persona",
+                placeholder="Nombre, apellido, CURP, sección, partido o ID...",
+                key="buscar_persona_eliminar",
             )
 
-            seleccionado = st.selectbox(
-                "Selecciona el registro",
-                nombres.tolist(),
-            )
+            filtrados = df.copy()
+            if busqueda_eliminar.strip():
+                termino = busqueda_eliminar.strip().lower()
+                columnas_busqueda = [
+                    "id",
+                    "nombre",
+                    "apellido_paterno",
+                    "apellido_materno",
+                    "curp",
+                    "seccion_municipal",
+                    "afiliacion_partido",
+                ]
+                columnas_busqueda = [
+                    columna for columna in columnas_busqueda
+                    if columna in filtrados.columns
+                ]
 
-            confirmar = st.checkbox(
-                "Confirmo que deseo eliminar este registro."
-            )
-
-            if st.button(
-                "Eliminar registro",
-                type="primary",
-            ):
-                if not confirmar:
-                    st.warning(
-                        "Marca la casilla de confirmación."
+                coincidencias = pd.Series(False, index=filtrados.index)
+                for columna in columnas_busqueda:
+                    coincidencias |= (
+                        filtrados[columna]
+                        .fillna("")
+                        .astype(str)
+                        .str.lower()
+                        .str.contains(termino, regex=False)
                     )
+                filtrados = filtrados[coincidencias]
+
+            st.caption(f"Personas encontradas: {len(filtrados)}")
+
+            # Confirmación del registro elegido.
+            id_pendiente = st.session_state.get("votante_pendiente_eliminar")
+            if id_pendiente is not None:
+                seleccionado_df = df[
+                    df["id"].astype(str) == str(id_pendiente)
+                ]
+
+                if seleccionado_df.empty:
+                    st.session_state.pop("votante_pendiente_eliminar", None)
+                    st.info("Ese registro ya no está disponible. Actualiza la lista.")
                 else:
-                    id_seleccionado = int(
-                        seleccionado.split(" — ", 1)[0]
+                    persona = seleccionado_df.iloc[0]
+                    nombre_persona = " ".join(
+                        str(persona.get(columna) or "").strip()
+                        for columna in (
+                            "nombre",
+                            "apellido_paterno",
+                            "apellido_materno",
+                        )
+                    ).strip()
+
+                    st.warning(
+                        f"¿Seguro que deseas eliminar a **{nombre_persona}** "
+                        f"(ID {id_pendiente})? Esta acción no se puede deshacer."
                     )
 
-                    sb.table("votantes").delete().eq(
-                        "id",
-                        id_seleccionado,
-                    ).execute()
+                    confirmar_col, cancelar_col = st.columns(2)
 
-                    registrar_evento(
-                        sb,
-                        usuario.id,
-                        "ELIMINÓ UN REGISTRO",
+                    with confirmar_col:
+                        if st.button(
+                            "Sí, eliminar definitivamente",
+                            type="primary",
+                            key="confirmar_borrar_votante",
+                            use_container_width=True,
+                        ):
+                            try:
+                                resultado = (
+                                    sb.table("votantes")
+                                    .delete()
+                                    .eq("id", id_pendiente)
+                                    .execute()
+                                )
+
+                                # Se vuelve a consultar para verificar que ya no exista.
+                                verificacion = (
+                                    sb.table("votantes")
+                                    .select("id")
+                                    .eq("id", id_pendiente)
+                                    .limit(1)
+                                    .execute()
+                                )
+
+                                if not verificacion.data:
+                                    registrar_evento(
+                                        sb,
+                                        usuario.id,
+                                        f"ELIMINÓ UN REGISTRO (ID {id_pendiente})",
+                                    )
+                                    st.session_state.pop(
+                                        "votante_pendiente_eliminar", None
+                                    )
+                                    st.success("Registro eliminado correctamente.")
+                                    st.rerun()
+                                else:
+                                    st.error(
+                                        "No se pudo confirmar la eliminación. "
+                                        "Revisa los permisos de Supabase y vuelve a intentarlo."
+                                    )
+                            except Exception as error_eliminar:
+                                mostrar_error(
+                                    "No se pudo eliminar el registro.",
+                                    error_eliminar,
+                                )
+
+                    with cancelar_col:
+                        if st.button(
+                            "Cancelar",
+                            key="cancelar_borrar_votante",
+                            use_container_width=True,
+                        ):
+                            st.session_state.pop(
+                                "votante_pendiente_eliminar", None
+                            )
+                            st.rerun()
+
+            st.divider()
+            st.subheader("Registros")
+
+            if filtrados.empty:
+                st.info("No se encontraron personas con esa búsqueda.")
+            else:
+                # Tabla visual con una acción independiente por fila.
+                encabezados = st.columns([0.7, 2.5, 1.2, 1.5, 1.2])
+                encabezados[0].markdown("**ID**")
+                encabezados[1].markdown("**Nombre completo**")
+                encabezados[2].markdown("**Sección**")
+                encabezados[3].markdown("**Afiliación**")
+                encabezados[4].markdown("**Acción**")
+                st.divider()
+
+                for _, fila in filtrados.iterrows():
+                    id_persona = fila.get("id")
+                    nombre_completo = " ".join(
+                        str(fila.get(columna) or "").strip()
+                        for columna in (
+                            "nombre",
+                            "apellido_paterno",
+                            "apellido_materno",
+                        )
+                    ).strip()
+                    seccion = str(fila.get("seccion_municipal") or "Sin sección")
+                    afiliacion = str(fila.get("afiliacion_partido") or "Sin especificar")
+
+                    c_id, c_nombre, c_seccion, c_partido, c_accion = st.columns(
+                        [0.7, 2.5, 1.2, 1.5, 1.2]
                     )
+                    c_id.write(str(id_persona))
+                    c_nombre.write(nombre_completo)
+                    c_seccion.write(seccion)
+                    c_partido.write(afiliacion)
 
-                    st.success("Registro eliminado.")
-                    st.rerun()
+                    if c_accion.button(
+                        "🗑️ Eliminar",
+                        key=f"seleccionar_borrar_votante_{id_persona}",
+                        use_container_width=True,
+                    ):
+                        st.session_state["votante_pendiente_eliminar"] = id_persona
+                        st.rerun()
 
     except Exception as e:
         mostrar_error(
-            "No se pudo eliminar el registro.",
+            "No se pudo cargar o eliminar el registro.",
             e,
         )
 
