@@ -4,4 +4,4 @@ matplotlib
 supabase
 openpyxl
 nreportlab
-n
+
