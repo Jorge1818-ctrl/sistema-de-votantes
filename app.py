@@ -8,6 +8,10 @@ import unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from supabase import create_client
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import landscape, letter
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 # =========================================================
 # CONFIGURACIÓN
@@ -94,7 +98,7 @@ def registrar_evento(
             "usuario_id": str(usuario_id),
             "evento": evento,
             "exitoso": exitoso,
-            "fecha": fecha_actual(),
+            "creado_en": fecha_actual(),
         }).execute()
     except Exception as e:
         print(f"No se pudo registrar el evento: {e}")
@@ -127,6 +131,78 @@ def mostrar_error(mensaje, error):
     st.error(mensaje)
     st.error("Detalles técnicos del error:")
     st.exception(error)
+
+
+def generar_excel(df):
+    """Crea un archivo Excel en memoria a partir de los registros."""
+    salida = io.BytesIO()
+    with pd.ExcelWriter(salida, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Votantes")
+    salida.seek(0)
+    return salida.getvalue()
+
+
+def generar_pdf(df, titulo="Reporte de registros de votantes"):
+    """Genera un PDF con los registros mostrados en pantalla."""
+    salida = io.BytesIO()
+    documento = SimpleDocTemplate(
+        salida,
+        pagesize=landscape(letter),
+        rightMargin=24,
+        leftMargin=24,
+        topMargin=24,
+        bottomMargin=24,
+    )
+    estilos = getSampleStyleSheet()
+    elementos = [
+        Paragraph(titulo, estilos["Title"]),
+        Spacer(1, 8),
+        Paragraph(f"Total de registros en el reporte: {len(df)}", estilos["Normal"]),
+        Spacer(1, 10),
+    ]
+
+    if df.empty:
+        elementos.append(Paragraph("No hay registros para mostrar.", estilos["Normal"]))
+    else:
+        # Evitar que el PDF tenga columnas excesivamente anchas.
+        columnas = [str(c) for c in df.columns]
+        filas = [columnas]
+        for _, fila in df.iterrows():
+            valores = []
+            for valor in fila.tolist():
+                if pd.isna(valor):
+                    valores.append("")
+                else:
+                    texto = str(valor)
+                    valores.append(texto[:100])
+            filas.append(valores)
+
+        ancho_util = landscape(letter)[0] - 48
+        ancho_columna = ancho_util / max(1, len(columnas))
+        tabla = Table(
+            filas,
+            repeatRows=1,
+            colWidths=[ancho_columna] * len(columnas),
+        )
+        tabla.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#243B53")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 6),
+            ("LEADING", (0, 0), (-1, -1), 7),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F2F5F8")]),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        elementos.append(tabla)
+
+    documento.build(elementos)
+    salida.seek(0)
+    return salida.getvalue()
 
 
 # =========================================================
@@ -530,13 +606,45 @@ if opcion == "Inicio":
     try:
         df = cargar_votantes(sb)
 
-        col1, col2 = st.columns(2)
-
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("Registros disponibles", len(df))
-
+            st.metric("Total de registros", len(df))
         with col2:
             st.metric("Tu rol", perfil.get("rol", "Sin rol"))
+        with col3:
+            secciones = df[COLUMNA_SECCION].nunique() if not df.empty and COLUMNA_SECCION in df.columns else 0
+            st.metric("Secciones registradas", int(secciones))
+        with col4:
+            partidos = df[COLUMNA_PARTIDO].nunique() if not df.empty and COLUMNA_PARTIDO in df.columns else 0
+            st.metric("Afiliaciones distintas", int(partidos))
+
+        if not df.empty:
+            st.subheader("Resumen y filtros")
+            filtros1, filtros2 = st.columns(2)
+            if COLUMNA_SECCION in df.columns:
+                secciones_disponibles = sorted(
+                    df[COLUMNA_SECCION].fillna("").astype(str).replace("", "Sin dato").unique().tolist()
+                )
+                with filtros1:
+                    seccion_filtro = st.selectbox("Filtrar por sección", ["Todas"] + secciones_disponibles)
+                if seccion_filtro != "Todas":
+                    df = df[df[COLUMNA_SECCION].fillna("").astype(str).replace("", "Sin dato") == seccion_filtro]
+            if COLUMNA_PARTIDO in df.columns:
+                partidos_disponibles = sorted(
+                    df[COLUMNA_PARTIDO].fillna("").astype(str).replace("", "Sin dato").unique().tolist()
+                )
+                with filtros2:
+                    partido_filtro = st.selectbox("Filtrar por afiliación", ["Todas"] + partidos_disponibles)
+                if partido_filtro != "Todas":
+                    df = df[df[COLUMNA_PARTIDO].fillna("").astype(str).replace("", "Sin dato") == partido_filtro]
+
+            st.caption(f"Registros que coinciden con los filtros: {len(df)}")
+            if COLUMNA_PARTIDO in df.columns:
+                st.subheader("Registros por afiliación partidista")
+                st.bar_chart(df[COLUMNA_PARTIDO].fillna("Sin dato").replace("", "Sin dato").value_counts())
+            if COLUMNA_SECCION in df.columns:
+                st.subheader("Registros por sección municipal")
+                st.bar_chart(df[COLUMNA_SECCION].fillna("Sin dato").replace("", "Sin dato").value_counts())
 
     except Exception as e:
         mostrar_error(
@@ -606,15 +714,25 @@ elif opcion == "Registrar persona" and admin:
                     "creado_por": str(usuario.id),
                 }
 
-                sb.table("votantes").insert(datos).execute()
-
-                registrar_evento(
-                    sb,
-                    usuario.id,
-                    "REGISTRÓ UNA PERSONA",
+                existente = (
+                    sb.table("votantes")
+                    .select("id")
+                    .eq("curp", datos["curp"])
+                    .limit(1)
+                    .execute()
                 )
+                if existente.data:
+                    st.warning("Ya existe un registro con esa CURP. No se guardó el duplicado.")
+                else:
+                    sb.table("votantes").insert(datos).execute()
 
-                st.success("Registro guardado correctamente.")
+                    registrar_evento(
+                        sb,
+                        usuario.id,
+                        "REGISTRÓ UNA PERSONA",
+                    )
+
+                    st.success("Registro guardado correctamente.")
 
             except Exception as e:
                 mostrar_error(
@@ -689,91 +807,89 @@ elif opcion == "Importar archivo de votantes" and admin:
                     total_importados = 0
                     total_omitidos = 0
                     errores_importacion = []
+                    registros_validos = []
+                    curps_archivo = set()
 
                     barra = st.progress(0)
                     estado = st.empty()
 
                     try:
-                        # Importar fila por fila permite que un
-                        # registro inválido no detenga los demás.
+                        # Consultar CURP existentes una sola vez para evitar
+                        # duplicados en Supabase y dentro del propio archivo.
+                        respuesta_curps = sb.table("votantes").select("curp").execute()
+                        curps_existentes = {
+                            str(registro.get("curp", "")).strip().upper()
+                            for registro in (respuesta_curps.data or [])
+                            if registro.get("curp")
+                        }
+
                         for indice, fila in df_archivo.iterrows():
                             try:
-                                edad_valor = convertir_edad(
-                                    fila.get("edad")
-                                )
-
-                                curp_valor = str(
-                                    fila["curp"]
-                                ).strip().upper()
-
+                                curp_valor = str(fila["curp"]).strip().upper()
                                 if len(curp_valor) != 18:
-                                    raise ValueError(
-                                        "La CURP no tiene 18 caracteres."
-                                    )
+                                    raise ValueError("La CURP no tiene 18 caracteres.")
+                                if curp_valor in curps_existentes:
+                                    raise ValueError("La CURP ya existe en la base de datos.")
+                                if curp_valor in curps_archivo:
+                                    raise ValueError("La CURP está repetida dentro del archivo.")
 
+                                edad_valor = convertir_edad(fila.get("edad"))
                                 datos = {
-                                    "nombre": str(
-                                        fila["nombre"]
-                                    ).strip(),
-                                    "apellido_paterno": str(
-                                        fila["apellido_paterno"]
-                                    ).strip(),
-                                    "apellido_materno": str(
-                                        fila.get(
-                                            "apellido_materno",
-                                            "",
-                                        )
-                                    ).strip(),
+                                    "nombre": str(fila["nombre"]).strip(),
+                                    "apellido_paterno": str(fila["apellido_paterno"]).strip(),
+                                    "apellido_materno": str(fila.get("apellido_materno", "")).strip(),
                                     "curp": curp_valor,
-                                    "domicilio": str(
-                                        fila["domicilio"]
-                                    ).strip(),
-                                    "seccion_municipal": str(
-                                        fila["seccion_municipal"]
-                                    ).strip(),
-                                    "afiliacion_partido": str(
-                                        fila["afiliacion_partido"]
-                                    ).strip(),
+                                    "domicilio": str(fila["domicilio"]).strip(),
+                                    "seccion_municipal": str(fila["seccion_municipal"]).strip(),
+                                    "afiliacion_partido": str(fila["afiliacion_partido"]).strip(),
                                     "creado_por": str(usuario.id),
                                 }
-
                                 if edad_valor is not None:
                                     datos["edad"] = edad_valor
 
-                                sb.table("votantes").insert(
-                                    datos
-                                ).execute()
-
-                                total_importados += 1
+                                registros_validos.append((int(indice) + 2, datos))
+                                curps_archivo.add(curp_valor)
 
                             except Exception as error_fila:
                                 total_omitidos += 1
-
                                 if len(errores_importacion) < 10:
                                     errores_importacion.append({
                                         "fila_archivo": int(indice) + 2,
                                         "motivo": str(error_fila),
                                     })
 
-                            progreso = (
-                                (total_importados + total_omitidos)
-                                / len(df_archivo)
-                            )
+                            procesadas = indice + 1
+                            barra.progress(min(procesadas / len(df_archivo), 1.0))
+                            estado.write(f"Validando {procesadas} de {len(df_archivo)} filas...")
 
-                            barra.progress(min(progreso, 1.0))
-                            estado.write(
-                                f"Procesadas "
-                                f"{total_importados + total_omitidos} "
-                                f"de {len(df_archivo)} filas..."
-                            )
+                        # Insertar por lotes para reducir llamadas a Supabase.
+                        tamano_lote = 200
+                        for inicio in range(0, len(registros_validos), tamano_lote):
+                            lote = registros_validos[inicio:inicio + tamano_lote]
+                            try:
+                                sb.table("votantes").insert(
+                                    [registro for _, registro in lote]
+                                ).execute()
+                                total_importados += len(lote)
+                            except Exception as error_lote:
+                                # Si un lote falla, intentar guardar cada fila
+                                # para identificar errores puntuales sin perder las demás.
+                                for numero_fila, registro in lote:
+                                    try:
+                                        sb.table("votantes").insert(registro).execute()
+                                        total_importados += 1
+                                    except Exception as error_fila:
+                                        total_omitidos += 1
+                                        if len(errores_importacion) < 10:
+                                            errores_importacion.append({
+                                                "fila_archivo": numero_fila,
+                                                "motivo": str(error_fila or error_lote),
+                                            })
 
                         registrar_evento(
                             sb,
                             usuario.id,
-                            (
-                                "IMPORTÓ ARCHIVO DE VOTANTES: "
-                                f"{total_importados} registros"
-                            ),
+                            f"IMPORTÓ ARCHIVO DE VOTANTES: {total_importados} registros",
                         )
 
                         st.subheader("Resultado de la importación")
@@ -907,6 +1023,19 @@ elif opcion == "Consultar registros":
                 file_name="registros_votantes.csv",
                 mime="text/csv",
             )
+            st.download_button(
+                "Descargar Excel (.xlsx)",
+                data=generar_excel(df),
+                file_name="reporte_votantes.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            st.download_button(
+                "Descargar PDF",
+                data=generar_pdf(df),
+                file_name="reporte_votantes.pdf",
+                mime="application/pdf",
+            )
 
     except Exception as e:
         mostrar_error(
@@ -934,6 +1063,22 @@ elif opcion == "Gráfica de registros":
             )
         else:
             st.metric("Total de registros", len(df))
+
+            export1, export2 = st.columns(2)
+            with export1:
+                st.download_button(
+                    "Descargar reporte Excel",
+                    data=generar_excel(df),
+                    file_name="reporte_graficas_votantes.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            with export2:
+                st.download_button(
+                    "Descargar reporte PDF",
+                    data=generar_pdf(df, "Reporte de gráficas y registros"),
+                    file_name="reporte_graficas_votantes.pdf",
+                    mime="application/pdf",
+                )
 
             if COLUMNA_PARTIDO in df.columns:
                 conteo_partidos = (
