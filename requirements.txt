@@ -3,5 +3,5 @@ pandas
 matplotlib
 supabase
 openpyxl
-nreportlab
+reportlab
 
