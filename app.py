@@ -962,86 +962,101 @@ elif opcion == "Importar archivo de votantes" and admin:
 # =========================================================
 
 elif opcion == "Consultar registros":
-    st.title("Consultar registros")
+    st.title("📝 Consultar registros | Pase de lista")
+    st.write("Busca a las personas por ID o nombre y marca su estado de votación.")
 
     try:
-        df = cargar_votantes(sb)
+        df_completo = cargar_votantes(sb)
 
-        if df.empty:
+        if df_completo.empty:
             st.info("Todavía no hay registros.")
         else:
-            busqueda = st.text_input(
-                "Buscar por nombre, CURP, sección o afiliación"
+            # El campo estado_voto se guarda en Supabase. Si aún no existe,
+            # primero ejecuta el SQL que aparece debajo del código.
+            if "estado_voto" not in df_completo.columns:
+                df_completo["estado_voto"] = "Pendiente"
+            df_completo["estado_voto"] = (
+                df_completo["estado_voto"].fillna("Pendiente").replace("", "Pendiente")
             )
 
+            total = len(df_completo)
+            votaron = int((df_completo["estado_voto"] == "Sí votó").sum())
+            no_votaron = int((df_completo["estado_voto"] == "No votó").sum())
+            pendientes = total - votaron - no_votaron
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total", total)
+            m2.metric("Sí votaron", votaron)
+            m3.metric("No votaron", no_votaron)
+            m4.metric("Pendientes", pendientes)
+
+            busqueda = st.text_input("🔎 Buscar por ID o nombre", key="buscar_pase_lista")
+            df_vista = df_completo.copy()
             if busqueda.strip():
-                columnas = [
-                    columna
-                    for columna in [
-                        "nombre",
-                        "apellido_paterno",
-                        "apellido_materno",
-                        "curp",
-                        "seccion_municipal",
-                        "afiliacion_partido",
-                    ]
-                    if columna in df.columns
-                ]
-
-                coincidencias = pd.Series(
-                    False,
-                    index=df.index,
-                )
-
-                for columna in columnas:
-                    coincidencias |= (
-                        df[columna]
-                        .fillna("")
-                        .astype(str)
-                        .str.contains(
-                            busqueda.strip(),
-                            case=False,
-                            regex=False,
+                term = busqueda.strip()
+                mask = pd.Series(False, index=df_vista.index)
+                for columna in ["id", "nombre", "apellido_paterno", "apellido_materno"]:
+                    if columna in df_vista.columns:
+                        mask |= df_vista[columna].fillna("").astype(str).str.contains(
+                            term, case=False, regex=False
                         )
-                    )
+                df_vista = df_vista[mask]
 
-                df = df[coincidencias]
+            columnas_nombre = [c for c in ["nombre", "apellido_paterno", "apellido_materno"] if c in df_vista.columns]
+            if columnas_nombre:
+                df_vista["Nombre completo"] = df_vista[columnas_nombre].fillna("").astype(str).agg(" ".join, axis=1).str.strip()
 
-            st.dataframe(
-                df,
+            columnas_mostrar = [c for c in ["id", "Nombre completo", "seccion_municipal", "afiliacion_partido", "estado_voto"] if c in df_vista.columns]
+            tabla = df_vista[columnas_mostrar].copy()
+            if "estado_voto" in tabla.columns:
+                tabla = tabla.rename(columns={"estado_voto": "Estado de votación"})
+
+            st.caption("Selecciona el estado en la última columna. Después pulsa ‘Guardar pase de lista’.")
+            estados = ["Pendiente", "Sí votó", "No votó"]
+            editada = st.data_editor(
+                tabla,
                 use_container_width=True,
                 hide_index=True,
+                disabled=[c for c in tabla.columns if c != "Estado de votación"],
+                column_config={
+                    "Estado de votación": st.column_config.SelectboxColumn(
+                        "Estado de votación", options=estados, required=True
+                    )
+                },
+                key="editor_pase_lista",
             )
 
-            csv = df.to_csv(
-                index=False,
-            ).encode("utf-8-sig")
+            if st.button("💾 Guardar pase de lista", type="primary", use_container_width=True):
+                try:
+                    cambios = 0
+                    for indice, fila_editada in editada.iterrows():
+                        id_persona = str(fila_editada["id"])
+                        estado = fila_editada["Estado de votación"]
+                        estado_anterior = str(df_vista.loc[indice, "estado_voto"])
+                        if estado != estado_anterior:
+                            sb.table("votantes").update({"estado_voto": estado}).eq("id", id_persona).execute()
+                            cambios += 1
+                    registrar_evento(sb, usuario.id, f"ACTUALIZÓ PASE DE LISTA ({cambios} cambios)")
+                    st.success(f"Pase de lista guardado. Registros actualizados: {cambios}.")
+                    st.rerun()
+                except Exception as e:
+                    mostrar_error("No se pudo guardar el pase de lista. Verifica que exista la columna estado_voto en Supabase.", e)
 
+            # Mantiene disponibles las exportaciones de la consulta filtrada.
+            exportar = df_vista.copy()
+            csv = exportar.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("Descargar CSV", data=csv, file_name="pase_lista.csv", mime="text/csv")
             st.download_button(
-                "Descargar CSV",
-                data=csv,
-                file_name="registros_votantes.csv",
-                mime="text/csv",
-            )
-            st.download_button(
-                "Descargar Excel (.xlsx)",
-                data=generar_excel(df),
-                file_name="reporte_votantes.xlsx",
+                "Descargar Excel (.xlsx)", data=generar_excel(exportar),
+                file_name="pase_lista.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-
             st.download_button(
-                "Descargar PDF",
-                data=generar_pdf(df),
-                file_name="reporte_votantes.pdf",
-                mime="application/pdf",
+                "Descargar PDF", data=generar_pdf(exportar),
+                file_name="pase_lista.pdf", mime="application/pdf",
             )
 
     except Exception as e:
-        mostrar_error(
-            "No se pudieron consultar los registros.",
-            e,
-        )
+        mostrar_error("No se pudieron consultar los registros.", e)
 
 
 # =========================================================
