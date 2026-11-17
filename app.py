@@ -78,14 +78,29 @@ def obtener_perfil(cliente, usuario_id):
 
 
 def cargar_votantes(cliente):
-    """Consulta exclusivamente numero y estado; nunca solicita datos personales."""
-    respuesta = (
-        cliente.table("votantes")
-        .select("numero, estado")
-        .order("numero")
-        .execute()
-    )
-    return pd.DataFrame(respuesta.data or [], columns=["numero", "estado"])
+    """Consulta todos los números en bloques de 1,000; solo solicita numero y estado."""
+    todos = []
+    inicio = 0
+    limite = 1000
+
+    while True:
+        respuesta = (
+            cliente.table("votantes")
+            .select("numero, estado")
+            .order("numero")
+            .range(inicio, inicio + limite - 1)
+            .execute()
+        )
+
+        datos = respuesta.data or []
+        todos.extend(datos)
+
+        if len(datos) < limite:
+            break
+
+        inicio += limite
+
+    return pd.DataFrame(todos, columns=["numero", "estado"])
 
 
 def mostrar_error(mensaje, error):
