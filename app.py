@@ -726,6 +726,20 @@ elif opcion == "Registrar persona" and admin:
                 else:
                     sb.table("votantes").insert(datos).execute()
 
+                    # El número de cuatro cifras lo asigna automáticamente
+                    # el trigger de Supabase al insertar el registro.
+                    codigo_resultado = (
+                        sb.table("votantes")
+                        .select("numero_control")
+                        .eq("curp", datos["curp"])
+                        .limit(1)
+                        .execute()
+                    )
+                    codigo_asignado = (
+                        codigo_resultado.data[0].get("numero_control")
+                        if codigo_resultado.data else None
+                    )
+
                     registrar_evento(
                         sb,
                         usuario.id,
@@ -733,6 +747,12 @@ elif opcion == "Registrar persona" and admin:
                     )
 
                     st.success("Registro guardado correctamente.")
+                    if codigo_asignado:
+                        st.markdown("### Número asignado")
+                        st.code(str(codigo_asignado).zfill(4), language=None)
+                        st.info("Entrega este número a la persona. Lo necesitará para localizar su registro en el pase de lista.")
+                    else:
+                        st.warning("El registro se guardó, pero no se pudo recuperar su número. Verifica que ejecutaste el SQL de numero_control en Supabase.")
 
             except Exception as e:
                 mostrar_error(
@@ -962,21 +982,25 @@ elif opcion == "Importar archivo de votantes" and admin:
 # =========================================================
 
 elif opcion == "Consultar registros":
-    st.title("📝 Consultar registros | Pase de lista")
-    st.write("Busca a las personas por ID o nombre y marca su estado de votación.")
+    st.title("📝 Pase de lista por número")
+    st.write("Escribe el número de cuatro cifras que presenta la persona. No necesitas buscar por nombre.")
 
     try:
         df_completo = cargar_votantes(sb)
 
         if df_completo.empty:
             st.info("Todavía no hay registros.")
+        elif "numero_control" not in df_completo.columns:
+            st.error("Todavía no existe el número de control en la tabla votantes.")
+            st.info("Primero ejecuta en Supabase el SQL de asignación automática de números que te dejo junto con este archivo.")
         else:
-            # El campo estado_voto se guarda en Supabase. Si aún no existe,
-            # primero ejecuta el SQL que aparece debajo del código.
             if "estado_voto" not in df_completo.columns:
                 df_completo["estado_voto"] = "Pendiente"
             df_completo["estado_voto"] = (
                 df_completo["estado_voto"].fillna("Pendiente").replace("", "Pendiente")
+            )
+            df_completo["numero_control"] = (
+                df_completo["numero_control"].astype(str).str.strip().str.zfill(4)
             )
 
             total = len(df_completo)
@@ -989,91 +1013,63 @@ elif opcion == "Consultar registros":
             m3.metric("No votaron", no_votaron)
             m4.metric("Pendientes", pendientes)
 
-            busqueda = st.text_input("🔎 Buscar por ID o nombre", key="buscar_pase_lista")
-            df_vista = df_completo.copy()
-            if busqueda.strip():
-                term = busqueda.strip()
-                mask = pd.Series(False, index=df_vista.index)
-                for columna in ["id", "nombre", "apellido_paterno", "apellido_materno"]:
-                    if columna in df_vista.columns:
-                        mask |= df_vista[columna].fillna("").astype(str).str.contains(
-                            term, case=False, regex=False
-                        )
-                df_vista = df_vista[mask]
+            st.markdown("### Buscar número")
+            with st.form("buscar_numero_pase_lista"):
+                numero_busqueda = st.text_input(
+                    "Número de control",
+                    max_chars=4,
+                    placeholder="Ej. 0025",
+                    help="Escribe las cuatro cifras que presenta la persona.",
+                )
+                buscar_numero = st.form_submit_button("Buscar número", use_container_width=True)
 
-            columnas_nombre = [c for c in ["nombre", "apellido_paterno", "apellido_materno"] if c in df_vista.columns]
-            if columnas_nombre:
-                df_vista["Nombre completo"] = df_vista[columnas_nombre].fillna("").astype(str).agg(" ".join, axis=1).str.strip()
+            if buscar_numero:
+                numero_limpio = numero_busqueda.strip()
+                if not numero_limpio.isdigit() or len(numero_limpio) not in (1, 2, 3, 4):
+                    st.warning("Escribe un número válido de hasta cuatro cifras.")
+                else:
+                    numero_limpio = numero_limpio.zfill(4)
+                    encontrado = df_completo[
+                        df_completo["numero_control"] == numero_limpio
+                    ]
+                    if encontrado.empty:
+                        st.error("No se encontró ningún registro con ese número.")
+                    else:
+                        fila = encontrado.iloc[0]
+                        st.success("Número encontrado.")
+                        st.markdown(f"## {numero_limpio}")
+                        estado_actual = str(fila.get("estado_voto", "Pendiente"))
+                        st.write(f"**Estado actual:** {estado_actual}")
+                        if estado_actual == "Sí votó":
+                            st.warning("Este número ya está marcado como que votó. Evita registrarlo nuevamente.")
+                        else:
+                            if st.button("✅ Marcar como YA VOTÓ", type="primary", use_container_width=True, key=f"marcar_voto_{numero_limpio}"):
+                                try:
+                                    sb.table("votantes").update({"estado_voto": "Sí votó"}).eq("numero_control", numero_limpio).execute()
+                                    registrar_evento(sb, usuario.id, f"MARCÓ COMO VOTÓ EL NÚMERO {numero_limpio}")
+                                    st.success(f"El número {numero_limpio} quedó marcado como ‘Sí votó’.")
+                                    st.rerun()
+                                except Exception as e:
+                                    mostrar_error("No se pudo actualizar el pase de lista.", e)
 
-            columnas_mostrar = [c for c in ["id", "Nombre completo", "seccion_municipal", "afiliacion_partido", "estado_voto"] if c in df_vista.columns]
-            tabla = df_vista[columnas_mostrar].copy()
-            if "estado_voto" in tabla.columns:
-                tabla = tabla.rename(columns={"estado_voto": "Estado de votación"})
+            st.divider()
+            st.markdown("### Estado general del pase de lista")
+            vista = df_completo[["numero_control", "estado_voto"]].copy()
+            vista = vista.rename(columns={
+                "numero_control": "Número",
+                "estado_voto": "Estado",
+            })
+            vista = vista.sort_values("Número")
+            st.dataframe(vista, use_container_width=True, hide_index=True)
 
-            st.caption("Marca el estado de cada persona y después pulsa ‘Guardar pase de lista’.")
-            estados = ["Pendiente", "Sí votó", "No votó"]
-
-            # Controles simples (selectbox) en lugar de st.data_editor,
-            # para mejorar compatibilidad con Safari/iPhone y evitar errores
-            # de carga de módulos del editor en el navegador móvil.
-            cambios_pendientes = {}
-            if df_vista.empty:
-                st.info("No se encontraron personas con esa búsqueda.")
-            else:
-                for _, fila in df_vista.iterrows():
-                    id_persona = str(fila["id"])
-                    nombre = str(fila.get("Nombre completo", "Sin nombre"))
-                    seccion = str(fila.get("seccion_municipal", ""))
-                    estado_actual = str(fila.get("estado_voto", "Pendiente"))
-                    if estado_actual not in estados:
-                        estado_actual = "Pendiente"
-
-                    col_persona, col_estado = st.columns([3, 2])
-                    with col_persona:
-                        st.write(f"**ID {id_persona}** — {nombre}")
-                        if seccion and seccion != "nan":
-                            st.caption(f"Sección: {seccion}")
-                    with col_estado:
-                        estado_nuevo = st.selectbox(
-                            "Estado",
-                            options=estados,
-                            index=estados.index(estado_actual),
-                            key=f"estado_voto_{id_persona}",
-                            label_visibility="collapsed",
-                        )
-                    if estado_nuevo != estado_actual:
-                        cambios_pendientes[id_persona] = estado_nuevo
-                    st.divider()
-
-            if st.button("💾 Guardar pase de lista", type="primary", use_container_width=True):
-                try:
-                    for id_persona, estado in cambios_pendientes.items():
-                        sb.table("votantes").update({"estado_voto": estado}).eq("id", id_persona).execute()
-                    registrar_evento(
-                        sb, usuario.id,
-                        f"ACTUALIZÓ PASE DE LISTA ({len(cambios_pendientes)} cambios)"
-                    )
-                    st.success(f"Pase de lista guardado. Registros actualizados: {len(cambios_pendientes)}.")
-                    st.rerun()
-                except Exception as e:
-                    mostrar_error("No se pudo guardar el pase de lista. Verifica que exista la columna estado_voto en Supabase.", e)
-
-            # Mantiene disponibles las exportaciones de la consulta filtrada.
-            exportar = df_vista.copy()
-            csv = exportar.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("Descargar CSV", data=csv, file_name="pase_lista.csv", mime="text/csv")
+            csv = vista.to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "Descargar Excel (.xlsx)", data=generar_excel(exportar),
-                file_name="pase_lista.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-            st.download_button(
-                "Descargar PDF", data=generar_pdf(exportar),
-                file_name="pase_lista.pdf", mime="application/pdf",
+                "Descargar pase de lista (CSV)", data=csv,
+                file_name="pase_lista_numeros.csv", mime="text/csv",
             )
 
     except Exception as e:
-        mostrar_error("No se pudieron consultar los registros.", e)
+        mostrar_error("No se pudieron consultar los registros del pase de lista.", e)
 
 
 # =========================================================
